@@ -1,0 +1,299 @@
+#include <WiFi.h>
+#include <FirebaseESP32.h>
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>  // ใช้ไลบรารีที่รองรับ ESP32
+#include <Adafruit_MLX90614.h>
+#include <PubSubClient.h>
+
+// ตั้งค่าการเชื่อมต่อ WiFi
+#define WIFI_SSID "" 
+#define WIFI_PASSWORD ""
+
+// ตั้งค่า Firebase
+#define FIREBASE_HOST "curexpert-651ee-default-rtdb.firebaseio.com"
+#define FIREBASE_AUTH "66SpdSwfiUmkKJl8XTLAVxJk62WBNxCGWANkL73c"
+
+// สร้างตัวแปรสำหรับการเก็บการตั้งค่า Firebase
+FirebaseData firebaseData;
+FirebaseConfig config;
+FirebaseAuth auth;
+
+// กำหนดที่อยู่ I2C ของ LCD และเซ็นเซอร์
+LiquidCrystal_I2C lcd(0x27, 20, 4); 
+Adafruit_MLX90614 mlx = Adafruit_MLX90614();
+
+// กำหนดพินของสวิตช์และ LED
+const int buttonPins[6] = {25, 26, 27, 13, 15, 12};
+const int switchPin = 23;
+const int ledPins[6] = {5, 18, 19, 33, 32, 4};  // พินสำหรับ LED
+const int ledWarningPin = 5; // กำหนดไฟ LED ดวงที่ 1
+
+unsigned long switchPressCounts[6] = {0, 0, 0, 0, 0, 0};  // เก็บจำนวนการกดสวิตช์แต่ละตัว
+
+volatile bool showTemp = false;
+unsigned long tempDisplayStartTime = 0;
+const unsigned long displayDuration = 10000; // 10000ms = 10 วินาที
+bool displayMessage = true; // ตัวแปรติดตามสถานะการแสดงข้อความ
+bool wasTempDisplayed = false; // ตัวแปรติดตามว่ามีการแสดงผลอุณหภูมิหรือไม่
+
+// ข้อความที่ต้องการแสดงในแต่ละปุ่ม
+const String messages[6][4] = {
+  {"Headache", "Take rest", "Drink water", "Use pain reliever"}, //ปวดหัว
+  {"Stomach ache & diarrhea", "Stay hydrated", "Eat light foods", "Rest"}, //ปวดท้อง
+  {"Stuffy nose", "Inhale steam", "Stay warm", "Rest well"}, //คัดจมูก
+  {"Sore throat", "Gargle with salt water", "Stay hydrated", "Use lozenges"}, //เจ็บคอ
+  {"Insect bites", "Avoid scratching", "Use cream", "Keep area clean"}, //แมลงกัดต่อย
+  {"Nausea and vomiting", "Drink water", "Eat bland foods", "Rest"} //คลื่นไส้อาเจียน
+};
+
+const String firebaseMessages[6][4] = {
+  {"ปวดหัว", "พักผ่อน", "ดื่มน้ำ", "ใช้ยาแก้ปวด"}, //ปวดหัว
+  {"ปวดท้อง & ท้องเสีย", "ดื่มน้ำให้เพียงพอ", "กินอาหารเบาๆ", "พักผ่อน"}, //ปวดท้อง
+  {"คัดจมูก", "สูดไอน้ำ", "รักษาความอบอุ่น", "พักผ่อนให้เพียงพอ"}, //คัดจมูก
+  {"เจ็บคอ", "กลั้วคอด้วยน้ำเกลือ", "ดื่มน้ำให้เพียงพอ", "ใช้ยาอมแก้เจ็บคอ"}, //เจ็บคอ
+  {"แมลงกัดต่อย", "หลีกเลี่ยงการเกา", "ใช้ยาครีม", "รักษาความสะอาดบริเวณ"}, //แมลงกัดต่อย
+  {"คลื่นไส้และอาเจียน", "ดื่มน้ำ", "กินอาหารรสจืด", "พักผ่อน"} //คลื่นไส้และอาเจียน
+};
+// Define paths for messages in Firebase
+const String messagePaths[6][4] = {
+  {"/messages/button1/0", "/messages/button1/1", "/messages/button1/2", "/messages/button1/3"},
+  {"/messages/button2/0", "/messages/button2/1", "/messages/button2/2", "/messages/button2/3"},
+  {"/messages/button3/0", "/messages/button3/1", "/messages/button3/2", "/messages/button3/3"},
+  {"/messages/button4/0", "/messages/button4/1", "/messages/button4/2", "/messages/button4/3"},
+  {"/messages/button5/0", "/messages/button5/1", "/messages/button5/2", "/messages/button5/3"},
+  {"/messages/button6/0", "/messages/button6/1", "/messages/button6/2", "/messages/button6/3"}
+};
+
+// ฟังก์ชัน toggleTempDisplay() ต้องอยู่ก่อนการเรียกใช้
+void toggleTempDisplay() {
+  showTemp = true; // เปิดการแสดงผลอุณหภูมิ
+  wasTempDisplayed = false;
+}
+
+void setup() {
+  Serial.begin(115200);
+
+  // เชื่อมต่อ WiFi
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(1000);
+    Serial.println("Connecting to WiFi...");
+  }
+  Serial.println("Connected to WiFi");
+
+  // ตั้งค่า Firebase
+  config.host = FIREBASE_HOST;
+  config.signer.tokens.legacy_token = FIREBASE_AUTH;
+
+  // เริ่มการเชื่อมต่อกับ Firebase
+  Firebase.begin(&config, &auth);
+  Firebase.reconnectWiFi(true);
+
+  // กำหนดพินของปุ่มและเซ็นเซอร์
+  for (int i = 0; i < 6; i++) {
+    pinMode(buttonPins[i], INPUT_PULLUP);
+    pinMode(ledPins[i], OUTPUT);  // ตั้งค่า LED เป็น OUTPUT
+  }
+  pinMode(switchPin, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(switchPin), toggleTempDisplay, FALLING);
+
+  lcd.init();
+  lcd.backlight();
+
+  // แสดงข้อความเริ่มต้น
+  lcd.setCursor(5, 0); 
+  lcd.print("Stay well"); 
+  lcd.setCursor(1, 1); 
+  lcd.print("I'm not a doctor");
+  lcd.setCursor(5, 2); 
+  lcd.print("But I care");
+  lcd.setCursor(6, 3); 
+  lcd.print("From CE");
+
+  // เริ่มต้นเซ็นเซอร์ MLX90614
+  if (!mlx.begin()) {
+    Serial.println("Failed to find MLX90614 sensor");
+    while (1);
+  }
+
+  // ตรวจสอบว่าการเชื่อมต่อสำเร็จหรือไม่
+  if (Firebase.ready()) {
+    Serial.println("Firebase is ready");
+  } else {
+    Serial.println("Failed to connect to Firebase");
+  }
+}
+
+void loop() {
+  // อ่านค่าอุณหภูมิจากเซ็นเซอร์
+  float tempC = mlx.readObjectTempC();
+  float tempF = mlx.readObjectTempF();
+
+  // ตรวจสอบอุณหภูมิและเปิด/ปิด LED ตามเงื่อนไข
+  if (tempC > 37.0) {
+    digitalWrite(ledWarningPin, HIGH); // เปิด LED ดวงที่ 1
+  } else {
+    digitalWrite(ledWarningPin, LOW); // ปิด LED ดวงที่ 1
+  }
+
+  // ถ้า showTemp เป็น true ให้แสดงอุณหภูมิบนจอ LCD
+  if (showTemp) {
+    lcd.clear(); // ล้างข้อความเดิม
+    lcd.setCursor(0, 0);
+    lcd.print("Temp: ");
+    lcd.print(tempC);
+    lcd.print(" C");
+
+    lcd.setCursor(0, 1);
+    lcd.print("Temp: ");
+    lcd.print(tempF);
+    lcd.print(" F");
+
+    delay(10000);
+
+    // แสดงข้อความเริ่มต้น
+    lcd.clear();
+    lcd.setCursor(5, 0); 
+    lcd.print("Stay well"); 
+    lcd.setCursor(1, 1); 
+    lcd.print("I'm not a doctor");
+    lcd.setCursor(5, 2); 
+    lcd.print("But I care");
+    lcd.setCursor(6, 3); 
+    lcd.print("From CE");
+
+    displayMessage = true; // ให้กลับไปแสดงข้อความเริ่มต้น
+
+    // เขียนข้อมูลไปยัง Firebase
+    if (Firebase.setFloat(firebaseData, "/temperature/Celsius", tempC)) {
+      Serial.println("Sent temperature to Firebase");
+    } else {
+      Serial.println("Failed to send temperature");
+      Serial.println(firebaseData.errorReason());
+    }
+
+    if (Firebase.setFloat(firebaseData, "/temperature/Fahrenheit", tempF)) {
+      Serial.println("Sent temperature to Firebase");
+    } else {
+      Serial.println("Failed to send temperature");
+      Serial.println(firebaseData.errorReason());
+    }
+
+    // เช็คเวลาแสดงผลอุณหภูมิ
+    if (millis() - tempDisplayStartTime >= displayDuration) {
+      showTemp = false;
+      wasTempDisplayed = false;
+      displayMessage = true;  // กลับไปแสดงข้อความอื่น ๆ
+    }
+  }
+
+  // ตรวจสอบการกดปุ่มและเก็บจำนวนการกดสวิตช์
+  bool anyButtonPressed = false; // ใช้ติดตามว่ามีการกดปุ่มหรือไม่
+
+  for (int i = 0; i < 6; i++) {
+    if (digitalRead(buttonPins[i]) == LOW && !wasTempDisplayed) {
+      anyButtonPressed = true; // มีการกดปุ่ม
+      switchPressCounts[i]++;  // เพิ่มจำนวนการกดปุ่ม
+
+      // ส่งสถานะปุ่มกดไปยัง Firebase
+      String buttonStatusPath = "/buttonStatus/button" + String(i + 1);
+      if (Firebase.setBool(firebaseData, buttonStatusPath.c_str(), true)) {
+        Serial.print("Sent button ");
+        Serial.print(i + 1);
+        Serial.println(" status (pressed) to Firebase");
+      } else {
+        Serial.print("Failed to send button ");
+        Serial.print(i + 1);
+        Serial.println(" status to Firebase");
+      }
+
+      // ล้างข้อความเดิม
+      lcd.clear();
+
+      // อัปเดตจำนวนการกดไปยัง Firebase
+      String path = "/switchPressCounts/button" + String(i + 1);
+      if (Firebase.setInt(firebaseData, path.c_str(), switchPressCounts[i])) {
+        Serial.print("Sent button ");
+        Serial.print(i + 1);
+        Serial.println(" count to Firebase");
+      } else {
+        Serial.print("Failed to send button ");
+        Serial.print(i + 1);
+        Serial.println(" count to Firebase");
+      }
+
+      // เปิด LED ที่ตรงกับปุ่มที่กด
+      digitalWrite(ledPins[i], HIGH);
+
+      // แสดงข้อความของปุ่มบน LCD
+      lcd.setCursor(0, 0);
+      lcd.print(messages[i][0]);
+      lcd.setCursor(0, 1);
+      lcd.print(messages[i][1]);
+      lcd.setCursor(0, 2);
+      lcd.print(messages[i][2]);
+      lcd.setCursor(0, 3);
+      lcd.print(messages[i][3]);
+
+      // เขียนข้อความของปุ่มไปยัง Firebase
+      for (int j = 0; j < 4; j++) {
+        if (Firebase.setString(firebaseData, messagePaths[i][j], firebaseMessages[i][j])) {
+          Serial.print("Sent message ");
+          Serial.print(j + 1);
+          Serial.print(" for button ");
+          Serial.print(i + 1);
+          Serial.println(" to Firebase");
+        } else {
+          Serial.print("Failed to send message ");
+          Serial.print(j + 1);
+          Serial.print(" for button ");
+          Serial.print(i + 1);
+          Serial.println(" to Firebase");
+        }
+      }
+
+      // รอ 30 วินาที
+      delay(30000);
+
+      // ปิด LED
+      digitalWrite(ledPins[i], LOW);
+
+      // อัปเดตสถานะปุ่มให้เป็น false (ไม่ได้กด)
+      if (Firebase.setBool(firebaseData, buttonStatusPath.c_str(), false)) {
+        Serial.print("Sent button ");
+        Serial.print(i + 1);
+        Serial.println(" status (released) to Firebase");
+      } else {
+        Serial.print("Failed to send button ");
+        Serial.print(i + 1);
+        Serial.println(" status to Firebase");
+      }
+
+      // แสดงข้อความเริ่มต้นอีกครั้ง
+      lcd.clear();
+      lcd.setCursor(5, 0); 
+      lcd.print("Stay well"); 
+      lcd.setCursor(1, 1); 
+      lcd.print("I'm not a doctor");
+      lcd.setCursor(5, 2); 
+      lcd.print("But I care");
+      lcd.setCursor(6, 3); 
+      lcd.print("From CE");
+
+      displayMessage = true;
+    }
+  }
+  // ถ้าไม่มีการกดปุ่มและข้อความควรแสดง
+  if (!anyButtonPressed && !displayMessage) {
+    lcd.clear();
+    lcd.setCursor(5, 0); 
+    lcd.print("Stay well"); 
+    lcd.setCursor(1, 1); 
+    lcd.print("I'm not a doctor");
+    lcd.setCursor(5, 2); 
+    lcd.print("But I care");
+    lcd.setCursor(6, 3); 
+    lcd.print("From CE");
+    displayMessage = true;
+  }
+}

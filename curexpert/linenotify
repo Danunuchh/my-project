@@ -1,0 +1,229 @@
+#include <Arduino.h>
+#include <WiFi.h>
+#include <Firebase_ESP_Client.h>
+#include <DHT.h>
+#include <LiquidCrystal_I2C.h>
+#include <TridentTD_LineNotify.h>
+
+
+// ใส่ข้อมูลของคุณที่นี่
+#define WIFI_SSID ""
+#define WIFI_PASSWORD ""
+#define API_KEY "AIzaSyBxQW6itu4vNSFmnASMrmQ43ozRAOm2laM"
+#define DATABASE_URL "https://test-fae9f-default-rtdb.firebaseio.com/"
+#define LINE_TOKEN "CTidhcRP7a0u6hQv2RRxb6uVIeUU1E3DQFWOWGiPfbM"
+
+// กำหนดค่า Pin ของเซ็นเซอร์และจอ LCD
+#define DHTPIN 4  // Pin ของเซ็นเซอร์ DHT22
+#define DHTTYPE DHT22
+DHT dht_sensor(DHTPIN, DHTTYPE);
+LiquidCrystal_I2C lcd(0x27, 20, 4);  // จอ LCD ขนาด 20x4
+
+FirebaseData fbdo;
+FirebaseAuth auth;
+FirebaseConfig config;
+bool signupOK = false;
+
+unsigned long sendDataPrevMillis = 0;
+unsigned long lcdUpdatePrevMillis = 0;
+unsigned long notifyPrevMillis = 0;  // สำหรับจับเวลาแจ้งเตือน Line
+const long lcdUpdateInterval = 1000;  // อัปเดตจอทุกๆ 1 วินาที
+const long notifyInterval = 600000;    // แจ้งเตือนผ่าน Line ทุกๆ 10 นาที
+
+void setup() {
+  dht_sensor.begin();  // เริ่มต้นเซ็นเซอร์ DHT22
+  Serial.begin(115200);
+
+  // เริ่มต้นจอ LCD
+  lcd.init();
+  lcd.backlight();
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("Connecting to Wi-Fi");
+
+  // เชื่อมต่อ Wi-Fi
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  while (WiFi.status() != WL_CONNECTED) {
+    Serial.print(".");
+    delay(300);
+  }
+  Serial.println();
+  Serial.print("Connected with IP: ");
+  Serial.println(WiFi.localIP());
+
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("Wi-Fi Connected");
+  lcd.setCursor(0, 1);
+  lcd.print(WiFi.localIP());
+
+  // เริ่มต้น Line Notify
+  LINE.setToken(LINE_TOKEN);
+
+  // กำหนดค่า API และ Database URL ของ Firebase
+  config.api_key = API_KEY;
+  config.database_url = DATABASE_URL;
+  
+  if (Firebase.signUp(&config, &auth, "", "")) {
+    signupOK = true;
+  } else {
+    Serial.printf("Error: %s\n", config.signer.signupError.message.c_str());
+  }
+
+  //config.token_status_callback = tokenStatusCallback; // ดูสถานะ token
+  Firebase.begin(&config, &auth);
+  Firebase.reconnectWiFi(true);
+}
+
+void loop() {
+  float temperature = dht_sensor.readTemperature();
+  float humidity = dht_sensor.readHumidity();
+
+  // อัปเดตจอ LCD ทุกๆ 1 วินาที
+  if (millis() - lcdUpdatePrevMillis > lcdUpdateInterval) {
+    lcdUpdatePrevMillis = millis();
+
+    if (temperature > 30) {
+      // อุณหภูมิสูงเกินไป
+      lcd.clear();
+      lcd.setCursor(0, 0);
+      lcd.print("Temp: ");
+      lcd.print(temperature);
+      lcd.print(" C");
+    
+      lcd.setCursor(0, 1);
+      lcd.print("Humidity: ");
+      lcd.print(humidity);
+      lcd.print("%");
+    
+      lcd.setCursor(0, 2);
+      lcd.print("Temp too high!");
+      lcd.setCursor(0, 3);
+      lcd.print("Turn on fan/AC");
+      Serial.println("อุณหภูมิห้องสูงเกินไป! เปิดพัดลมหรือเครื่องปรับอากาศ");
+
+      // แจ้งเตือนผ่าน Line
+      if (millis() - notifyPrevMillis > notifyInterval) {
+        notifyPrevMillis = millis();
+        LINE.notifySticker(String("อุณหภูมิ: ") + temperature + " C  อุณหภูมิห้องสูงเกินไป! เปิดพัดลมหรือเครื่องปรับอากาศ",789,10892);
+      }
+
+    } else if (temperature < 15) {
+      // อุณหภูมิต่ำเกินไป
+      lcd.clear();
+      lcd.setCursor(0, 0);
+      lcd.print("Temp: ");
+      lcd.print(temperature);
+      lcd.print(" C");
+    
+      lcd.setCursor(0, 1);
+      lcd.print("Humidity: ");
+      lcd.print(humidity);
+      lcd.print("%");
+    
+      lcd.setCursor(0, 2);
+      lcd.print("Temp too low!");
+      lcd.setCursor(0, 3);
+      lcd.print("Turn on heater");
+      Serial.println("อุณหภูมิห้องต่ำเกินไป! ปรับเครื่องทำความร้อน");
+
+      // แจ้งเตือนผ่าน Line
+      if (millis() - notifyPrevMillis > notifyInterval) {
+        notifyPrevMillis = millis();
+        LINE.notifySticker(String("อุณหภูมิ: ") + temperature + " C  อุณหภูมิห้องต่ำเกินไป! ปรับเครื่องทำความร้อน",789,10894);
+      }
+
+    } else if (humidity > 60) {
+      // ความชื้นสูงเกินไป
+      lcd.clear();
+      lcd.setCursor(0, 0);
+      lcd.print("Temp: ");
+      lcd.print(temperature);
+      lcd.print(" C");
+    
+      lcd.setCursor(0, 1);
+      lcd.print("Humidity: ");
+      lcd.print(humidity);
+      lcd.print("%");
+    
+      lcd.setCursor(0, 2);
+      lcd.print("Humidity high!");
+      lcd.setCursor(0, 3);
+      lcd.print("Open window/use dehum.");
+      Serial.println("ความชื้นสูงเกินไป! เปิดหน้าต่างหรือใช้เครื่องลดความชื้น");
+
+      // แจ้งเตือนผ่าน Line
+      if (millis() - notifyPrevMillis > notifyInterval) {
+        notifyPrevMillis = millis();
+        LINE.notifySticker(String("ความชื้น: ") + humidity + "%  ความชื้นสูงเกินไป! เปิดหน้าต่างหรือใช้เครื่องลดความชื้น",11539,52114137);
+      }
+
+    } else if (humidity < 30) {
+      // ความชื้นต่ำเกินไป
+      lcd.clear();
+      lcd.setCursor(0, 0);
+      lcd.print("Temp: ");
+      lcd.print(temperature);
+      lcd.print(" C");
+
+      lcd.setCursor(0, 1);
+      lcd.print("Humidity: ");
+      lcd.print(humidity);
+      lcd.print("%");
+    
+      lcd.setCursor(0, 2);
+      lcd.print("Humidity low!");
+      lcd.setCursor(0, 3);
+      lcd.print("Use humidifier");
+      Serial.println("ความชื้นต่ำเกินไป! ใช้เครื่องเพิ่มความชื้น");
+
+      // แจ้งเตือนผ่าน Line
+      if (millis() - notifyPrevMillis > notifyInterval) {
+        notifyPrevMillis = millis();
+        LINE.notifySticker(String("ความชื้น: ") + humidity + "%  ความชื้นต่ำเกินไป! ใช้เครื่องเพิ่มความชื้น",11539,52114127);
+      }
+
+    } else {
+      // สภาพแวดล้อมปกติ
+      lcd.clear();
+      lcd.setCursor(0, 0);
+      lcd.print("Temp: ");
+      lcd.print(temperature);
+      lcd.print(" C");
+    
+      lcd.setCursor(0, 1);
+      lcd.print("Humidity: ");
+      lcd.print(humidity);
+      lcd.print("%");
+    
+      lcd.setCursor(0, 2);
+      lcd.print("Environment is normal");
+      Serial.println("สภาพแวดล้อมปกติ");
+
+      // แจ้งเตือนผ่าน Line
+      if (millis() - notifyPrevMillis > notifyInterval) {
+        notifyPrevMillis = millis();
+        LINE.notifySticker(String("อุณหภูมิ: ") + temperature + " C ความชื้น: " + humidity + "%  ภาพแวดล้อมปกติ",11537,52002745);
+      }
+    }
+  }
+
+  // อัปเดตข้อมูลใน Firebase ทุกๆ 1 วินาที
+  if (Firebase.ready() && signupOK && (millis() - sendDataPrevMillis > 1000 || sendDataPrevMillis == 0)) {
+    sendDataPrevMillis = millis();
+
+    if (Firebase.RTDB.setFloat(&fbdo, "DHT_22/Temperature", temperature)) {
+      Serial.print("Temperature: ");
+      Serial.println(temperature);
+    } else {
+      Serial.println("Failed to update temperature");
+    }
+
+    if (Firebase.RTDB.setFloat(&fbdo, "DHT_22/Humidity", humidity)) {
+      Serial.print("Humidity: ");
+      Serial.println(humidity);
+    } else {
+      Serial.println("Failed to update humidity");
+    }
+  }
+}
